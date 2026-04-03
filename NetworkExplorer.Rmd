@@ -1,0 +1,519 @@
+---
+title:
+author: "Andrew Patt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cerulean
+    highlight: tango
+runtime: shiny
+---
+
+```{r,echo=FALSE}
+knitr::opts_chunk$set(message=FALSE,warning=FALSE, 
+                      fig.height=6,fig.width = 12,fig.fullwidth = TRUE,echo = FALSE)
+```
+
+```{r USER EDIT THIS CHUNK ONLY}
+
+## Path for your Network data manifest
+excel_path <- "NetworkExplorerMelanoma.xlsx"
+is_bipartite <- FALSE
+user_palette <- FALSE
+```
+
+
+```{r}
+node_metadata <- readxl::read_excel(excel_path, sheet = 1) |>
+  dplyr::mutate(
+    Node_Name = as.character(Node_Name),
+    Node_Label = dplyr::case_when(
+      is.na(Node_Label) | Node_Label == "" ~ as.character(Node_Name),
+      TRUE ~ as.character(Node_Label)
+    ),
+    Color_Factor = dplyr::case_when(
+      is.na(Color_Factor) | Color_Factor == "" ~ NA_character_,
+      TRUE ~ as.character(Color_Factor)
+    ),
+    Shape_Factor = dplyr::case_when(
+      is.na(Shape_Factor) | Shape_Factor == "" ~ NA_character_,
+      TRUE ~ as.character(Shape_Factor)
+    )
+  ) |>
+  dplyr::select(Node_Name, Node_Label, Color_Factor, Shape_Factor) |>
+  dplyr::distinct(Node_Name, .keep_all = TRUE) |>
+  dplyr::filter(!is.na(Node_Name), Node_Name != "")
+
+selected_nodes <- node_metadata$Node_Name
+
+node_data <- readxl::read_excel(excel_path, sheet = 2) |>
+  dplyr::mutate(
+    Node = as.character(Node),
+    Observation = as.character(Observation),
+    Value = as.numeric(Value)
+  ) |>
+  dplyr::select(Node, Observation, Value)
+
+node_mask_raw <- readxl::read_excel(excel_path, sheet = 3)
+
+masked_observations <- tibble::tibble(
+  Observation = as.character(node_mask_raw[[4]]),
+  Mask = dplyr::coalesce(as.logical(node_mask_raw[[5]]), FALSE)
+) |>
+  dplyr::filter(Mask, !is.na(Observation), Observation != "") |>
+  dplyr::distinct(Observation)
+
+masked_nodes <- tibble::tibble(
+  Node = as.character(node_mask_raw[[1]]),
+  Mask = dplyr::coalesce(as.logical(node_mask_raw[[2]]), FALSE)
+) |>
+  dplyr::filter(Mask, !is.na(Node), Node != "") |>
+  dplyr::distinct(Node)
+
+node_data_filtered <- node_data |>
+  dplyr::filter(
+    !Observation %in% masked_observations$Observation,
+    !Node %in% masked_nodes$Node
+  ) |>
+  dplyr::select(Node, Observation, Value)
+
+if(is_bipartite) {
+  bipartite_edges <- node_data_filtered |>
+    dplyr::mutate(
+      from = paste0("node::", Node),
+      to = paste0("obs::", Observation)
+    ) |>
+    dplyr::select(from, to, value = Value)
+
+  bipartite_edges <- dplyr::bind_rows(
+    bipartite_edges,
+    bipartite_edges |>
+      dplyr::mutate(from_rev = to, to_rev = from) |>
+      dplyr::select(from = from_rev, to = to_rev, value)
+  )
+
+  bipartite_ids <- union(unique(bipartite_edges$from), unique(bipartite_edges$to))
+  cormat_wide <- stats::xtabs(
+    value ~ from + to,
+    data = bipartite_edges |>
+      dplyr::mutate(
+        from = factor(from, levels = bipartite_ids),
+        to = factor(to, levels = bipartite_ids)
+      )
+  ) |>
+    as.matrix()
+
+  node_display_metadata <- dplyr::bind_rows(
+    node_data_filtered |>
+      dplyr::distinct(Node) |>
+      dplyr::rename(Node_Name = Node) |>
+      dplyr::mutate(
+        Node_ID = paste0("node::", Node_Name),
+        Partition = "Node"
+      ),
+    node_data_filtered |>
+      dplyr::distinct(Observation) |>
+      dplyr::rename(Node_Name = Observation) |>
+      dplyr::mutate(
+        Node_ID = paste0("obs::", Node_Name),
+        Partition = "Observation"
+      )
+  ) |>
+    dplyr::left_join(node_metadata, by = "Node_Name") |>
+    dplyr::mutate(
+      Node_Label = dplyr::case_when(
+        is.na(Node_Label) | Node_Label == "" ~ Node_Name,
+        TRUE ~ Node_Label
+      )
+    )
+
+  node_display_metadata$Node_Label <- make.unique(node_display_metadata$Node_Label)
+  node_display_metadata <- node_display_metadata |>
+    dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
+} else {
+  selected_nodes <- intersect(selected_nodes, unique(node_data_filtered$Node))
+  if(length(selected_nodes) == 0) {
+    stop(
+      "No unmasked nodes from Metadata$Node_Name remain after filtering. ",
+      "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet."
+    )
+  }
+  if(length(selected_nodes) < 2) {
+    stop(
+      "At least two unmasked nodes from Metadata$Node_Name are required to compute correlations. ",
+      "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet."
+    )
+  }
+
+  node_value_matrix <- node_data_filtered |>
+    dplyr::filter(Node %in% selected_nodes) |>
+    tidyr::pivot_wider(names_from = Node, values_from = Value) |>
+    tibble::column_to_rownames("Observation") |>
+    as.matrix()
+
+  translated_labels <- node_metadata$Node_Label[match(colnames(node_value_matrix), node_metadata$Node_Name)]
+  translated_labels[is.na(translated_labels)] <- colnames(node_value_matrix)[is.na(translated_labels)]
+  translated_labels <- make.unique(translated_labels)
+
+  cor_matrix <- cor(node_value_matrix, use = "pairwise.complete.obs")
+  rownames(cor_matrix) <- translated_labels
+  colnames(cor_matrix) <- translated_labels
+  cormat_wide <- cor_matrix
+
+  node_display_metadata <- tibble::tibble(
+    Node_ID = translated_labels,
+    Node_Name = colnames(node_value_matrix)
+  ) |>
+    dplyr::left_join(
+      node_metadata |>
+        dplyr::select(Node_Name, Color_Factor, Shape_Factor),
+      by = "Node_Name"
+    ) |>
+    dplyr::mutate(
+      Node_Label = Node_ID,
+      Partition = "Correlation"
+    ) |>
+    dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
+}
+
+cormat_wide[is.na(cormat_wide)] <- 0
+
+cormat <- as.data.frame(as.table(cormat_wide)) |>
+  tibble::as_tibble() |>
+  dplyr::rename(
+    Var1 = dplyr::any_of(c("Var1", "from")),
+    Var2 = dplyr::any_of(c("Var2", "to")),
+    value = dplyr::any_of(c("Freq", "value"))
+  )
+
+```
+
+
+```{r}
+recompute_network <- function(cormat,cutoff, cluster = NA,
+                              filter_pos_corr, filter_neg_corr, filter_singletons) {
+
+  if(filter_neg_corr) {
+    cormat[cormat < 0] <- 0
+    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Reds"))
+  } else if(filter_pos_corr) {
+    cormat[cormat > 0] <- 0
+    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))
+  } else {
+    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "RdBu"))
+  }
+  
+  cor_network <- igraph::graph_from_adjacency_matrix(as.matrix(cormat),
+                                                     diag = FALSE,
+                                                     mode = "max",
+                                                     weighted = TRUE)
+  
+  
+  ncols <- max(order(igraph::E(cor_network)$weight))
+  edge_palette <- palette(ncols)
+  igraph::E(cor_network)$color <- edge_palette[order(igraph::E(cor_network)$weight)]
+  
+  cluster <- as.numeric(cluster)
+  cor_network <- cor_network |>
+    igraph::set_edge_attr("true_weight",value = igraph::E(cor_network)$weight) |>
+    igraph::set_edge_attr("weight",
+                          value = sapply(igraph::E(cor_network)$weight, function(x) {
+                            ifelse(abs(x) > cutoff,return(abs(x)), return(0))
+                          }))
+  cor_network <- 
+    igraph::delete_edges(cor_network, which(igraph::E(cor_network)$weight == 0))
+  if(filter_singletons) {
+    nodes_to_remove <- which(igraph::degree(cor_network) == 0)
+    cor_network <- igraph::delete_vertices(cor_network, nodes_to_remove)
+  }
+  cor_betweenness <- igraph::betweenness(cor_network,directed=FALSE)
+  
+  cor_network <- cor_network |>
+     igraph::set_vertex_attr("betweenness", value = cor_betweenness)
+
+  cluster_membership <- igraph::membership(igraph::cluster_louvain(cor_network))
+  display_network <- cor_network
+  if(!is.na(cluster)) {
+    selected_vertices <- which(cluster_membership == cluster)
+    display_network <- igraph::induced_subgraph(cor_network, vids = selected_vertices)
+  }
+  if(igraph::vcount(display_network) == 0) {
+    module_count <- 0
+    modularity_value <- NA_real_
+  } else if(igraph::ecount(display_network) == 0) {
+    module_count <- igraph::vcount(display_network)
+    modularity_value <- 0
+  } else {
+    display_cluster <- igraph::cluster_louvain(display_network)
+    module_count <- length(unique(igraph::membership(display_cluster)))
+    modularity_value <- igraph::modularity(display_cluster)
+  }
+  cluster_palette <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(11, "Spectral"))
+  palette <- cluster_palette(length(unique(cluster_membership)))
+  vertex_ids <- unname(igraph::V(cor_network)$name)
+  vertex_metadata <- node_display_metadata[match(vertex_ids, node_display_metadata$Node_ID), ]
+  vertex_labels <- unname(vertex_metadata$Node_Label)
+  vertex_labels[is.na(vertex_labels)] <- vertex_ids[is.na(vertex_labels)]
+  node_colors <- unname(palette[as.numeric(cluster_membership)])
+  
+  if(any(!is.na(node_display_metadata$Color_Factor))) {
+    node_color_lookup <- node_display_metadata |>
+      dplyr::filter(!is.na(Color_Factor), Color_Factor != "") |>
+      dplyr::distinct(Node_ID, .keep_all = TRUE)
+    if(user_palette) {
+      metadata_node_colors <- node_color_lookup$Color_Factor
+    } else {
+      color_levels <- unique(node_color_lookup$Color_Factor)
+      color_palette <- grDevices::hcl.colors(length(color_levels), palette = "Spectral")
+      names(color_palette) <- color_levels
+      metadata_node_colors <- color_palette[node_color_lookup$Color_Factor]
+    }
+    names(metadata_node_colors) <- node_color_lookup$Node_ID
+    node_colors <- unname(metadata_node_colors[vertex_ids])
+    missing_node_colors <- is.na(node_colors)
+    node_colors[missing_node_colors] <- "grey"
+  }
+
+  if(is_bipartite) {
+    node_shapes <- unname(ifelse(vertex_metadata$Partition == "Node", "square", "dot"))
+    node_shapes[is.na(node_shapes)] <- "dot"
+  } else {
+    node_shapes <- rep("dot", length(vertex_ids))
+  }
+
+  if(any(!is.na(node_display_metadata$Shape_Factor))) {
+    node_shape_lookup <- node_display_metadata |>
+      dplyr::filter(!is.na(Shape_Factor), Shape_Factor != "") |>
+      dplyr::distinct(Node_ID, .keep_all = TRUE)
+    metadata_node_shapes <- node_shape_lookup$Shape_Factor
+    names(metadata_node_shapes) <- node_shape_lookup$Node_ID
+    matched_shapes <- metadata_node_shapes[vertex_ids]
+    node_shapes[!is.na(matched_shapes)] <- unname(matched_shapes[!is.na(matched_shapes)])
+  }
+  
+  igraph::V(cor_network)$frame.color <- "white"
+  igraph::V(cor_network)$frame.width <- 0
+  cor_network_df <- igraph::as_long_data_frame(cor_network)
+  nodes <- data.frame(id = vertex_ids,
+                      group = unname(as.numeric(cluster_membership)),
+                      label = vertex_labels,
+                      ## value = (cor_betweenness/max(cor_betweenness))*15,
+                      color=node_colors,
+                      ## font.size = (cor_betweenness+.1)/max(cor_betweenness),
+                      title = paste0("<p><b>", "</b><br>Name:", vertex_labels,
+                                     "<p><b>", "</b><br>Module:", unname(as.numeric(cluster_membership)),
+                                     "<p><b>", "</b><br>Betweenness: ", unname(cor_betweenness)),
+                      shape = node_shapes,
+                      row.names = NULL
+                      )
+  edges <- data.frame(from = cor_network_df$from_name,
+                      to = cor_network_df$to_name,
+                      width = unname(igraph::E(cor_network)$weight/max(igraph::E(cor_network)$weight)),
+                      color = unname(igraph::E(cor_network)$color),
+                      row.names = NULL
+                      )
+  if(!is.na(cluster)) {
+    nodes <- nodes |>
+      dplyr::filter(group == cluster)
+    edges <- edges |>
+      dplyr::filter(from %in% nodes$id & to %in% nodes$id)
+  }
+  return(list(nodes, edges, module_count = module_count, modularity = modularity_value))
+}
+
+make_network_visual <- function(nodes, edges) {
+    return(visNetwork::visNetwork(nodes, edges,height = "2000px", width = "100%")|>
+           visNetwork::visInteraction(navigationButtons = TRUE) |>
+           visNetwork::visPhysics(stabilization = FALSE) |>
+           visNetwork::visEdges(smooth = FALSE) |>
+           visNetwork::visIgraphLayout(layout = "layout_nicely"))
+}
+
+```
+
+
+<style>
+html, body {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow-x: hidden !important;
+  background-color: teal !important;
+}
+
+.main-container {
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+#section-network-explorer {
+  margin: 0 !important;
+  padding: 0 !important;
+  background-color: teal !important;
+}
+
+#section-network-explorer > h2 {
+  margin: 0 !important;
+  padding: 12px 15px 0 15px !important;
+  background-color: white !important;
+}
+
+.shiny-frame {
+  display: block !important;
+  width: 100% !important;
+  border: 0 !important;
+  background-color: teal !important;
+}
+</style>
+
+```{r}
+
+shiny::shinyApp(
+  ui = shiny::fluidPage(
+    shiny::tags$head(
+      shiny::tags$style(
+                    shiny::HTML("
+          html, body {
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
+            overflow-x: hidden !important;
+            background-color: teal !important;
+          }
+          .main-container {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            margin: 0 !important;
+            padding: 0 !important;
+          }
+          .container-fluid {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            margin: 0 !important;
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+          }
+          .row {
+            width: 100% !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+          }
+          .teal-margin {
+            background-color: teal;
+            min-height: 100vh;
+            padding-left: 0;
+            padding-right: 0;
+          }
+          .main-panel {
+            background-color: white;
+            min-height: 100vh;
+            padding: 15px;
+          }
+          .ui-help-box {
+            background-color: #e6e6e6;
+            border: 1px solid #bdbdbd;
+            border-radius: 4px;
+            margin-top: 20px;
+            padding: 12px 15px;
+          }
+          .network-stats-box {
+            background-color: #e6e6e6;
+            border: 1px solid #bdbdbd;
+            border-radius: 4px;
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            font-weight: bold;
+          }
+        ")
+      )
+    ),
+    shiny::fluidRow(
+      shiny::column(1, class = "teal-margin", style = "width: 12.5%;"),
+      shiny::column(
+        10,
+        class = "main-panel",
+        style = "width: 75%;",
+        visNetwork::visNetworkOutput("mynetwork", height = "600px"),
+        shiny::fluidRow(
+          shiny::column(
+            6,
+            shiny::fluidRow(
+                     shiny::div(
+                              class = "network-stats-box",
+                              shiny::textOutput("network_stats")
+                            ),
+              shiny::numericInput("cor_adjust", label = "Correlation cutoff:",
+                                  min = 0, max = 1, value = .1, step = 0.01),
+              shiny::textInput("pick_module", label = "Only show module #:")
+
+              )
+            ),
+          shiny::column(
+            6,
+            shiny::fluidRow(
+ shinydashboard::sidebarSearchForm(textId = "searchText", buttonId = "searchButton", label = "Zoom node..."),
+                     shiny::checkboxInput("filter_corr_pos", "Remove positive correlations"),
+                     shiny::checkboxInput("filter_corr_neg", "Remove negative correlations"),
+                     shiny::checkboxInput("filter_singletons", "Remove unconnected nodes")
+              
+                   )
+        )),
+        shiny::div(
+          class = "ui-help-box",
+          shiny::tags$strong("Network Explorer"),
+          shiny::tags$p("'Current Network Stats' dynamically displays the module count and modularity of the currently displayed network."),
+          shiny::tags$p("'Correlation cutoff' removes edges whose absolute correlation is below the selected threshold."),
+          shiny::tags$p("'Only show module #' limits the display to nodes assigned to a single detected network module."),
+          shiny::tags$p("'Find node' searches for an exact node label match and centers the network on that node when found."),
+          shiny::tags$p("'Remove positive correlations' hides positively correlated edges."),
+          shiny::tags$p("'Remove negative correlations' hides negatively correlated edges."),
+          shiny::tags$p("'Remove unconnected nodes' hides nodes with no neighbors.")
+        )
+      ),
+      shiny::column(1, class = "teal-margin", style = "width: 12.5%;")
+    )
+  ),
+  
+  server = function(input, output,session) {
+    reactive_network <- shiny::reactive({
+      recompute_network(cormat_wide, input$cor_adjust, input$pick_module,
+                        input$filter_corr_pos, input$filter_corr_neg, input$filter_singletons)})
+    output$mynetwork = visNetwork::renderVisNetwork({
+      make_network_visual(reactive_network()[[1]], reactive_network()[[2]])})
+    output$network_stats <- shiny::renderText({
+      current_network <- reactive_network()
+      modularity_text <- if(is.na(current_network$modularity)) {
+        "NA"
+      } else {
+        sprintf("%.3f", round(current_network$modularity, 3))
+      }
+      paste0(
+        "Current Network Stats | Modules: ",
+        ifelse(input$pick_module == "",
+               current_network$module_count,1),
+        " | Modularity: ", modularity_text
+      )
+    })
+    shiny::observe({
+      if(input$searchButton > 0) {
+        shiny::isolate({
+          current_node <- reactive_network()[[1]] |>
+            dplyr::filter(label == input$searchText) |>
+            dplyr::pull(id)
+          if(length(current_node) > 0) {
+            visNetwork::visNetworkProxy("mynetwork") |> visNetwork::visFocus(id = current_node[[1]])
+          }
+        })
+      }
+    })
+  },
+
+  options = list(height = "950px")
+)
+
+  
+```
