@@ -61,11 +61,11 @@ The app expects an Excel workbook with three sheets:
 1. `Metadata`
    Contains node-level display metadata.
    Required columns:
-   - `Node_Name`
+   - `Node_Name`: The node level objects that will appear in correlation networks. Observations are used to calculate correlations
    Optional columns:
-   - `Node_Label`
-   - `Color_Factor`
-   - `Shape_Factor`
+   - `Node_Label`: Display name for node in network
+   - `Color_Factor`: Allows custom color designation. Can either be group designations or hexadecimals for more control over palette (specify user_palette = TRUE in script in this case). If left blank, nodes are automatically colored by louvain cluster membership
+   - `Shape_Factor`: Similar to color, only accepts group designations at this time
 
 2. Data sheet
    Long-format measurements with columns:
@@ -75,7 +75,6 @@ The app expects an Excel workbook with three sheets:
 
 3. `Data_Mask`
    Used to exclude nodes or observations before the network is built.
-   The current app logic reads:
    - columns 1-2 for node masking
    - columns 4-5 for observation masking
 
@@ -92,14 +91,3 @@ Use `NetworkExplorerTemplate.xlsx` as the starting point for new datasets.
 - Exact-match node search and focus
 - Node label, color, and shape customization from metadata
 
-## Notes
-
-- In correlation mode, at least two unmasked nodes from the metadata sheet must remain after filtering.
-- In bipartite mode, observations are included as their own partition in the graph.
-- If `user_palette` is `FALSE`, node colors are generated from metadata categories. If `TRUE`, `Color_Factor` values are treated as literal colors.
-
-## Suggested Next Steps
-
-- Add a reproducible example workbook with a small toy dataset
-- Pin package versions with `renv` if this will be shared widely
-- Document the exact expected column names in the Excel template itself
