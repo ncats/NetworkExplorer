@@ -77,6 +77,18 @@ node_data_filtered <- node_data |>
   ) |>
   dplyr::select(Node, Observation, Value)
 
+compute_correlation_pvalues <- function(value_matrix) {
+  pairwise_counts <- crossprod(!is.na(value_matrix))
+  cor_matrix <- stats::cor(value_matrix, use = "pairwise.complete.obs")
+  cor_squared <- pmin(cor_matrix^2, 1)
+  denominator <- pmax(1 - cor_squared, .Machine$double.eps)
+  t_stat <- cor_matrix * sqrt(pmax(pairwise_counts - 2, 0) / denominator)
+  pval_matrix <- 2 * stats::pt(-abs(t_stat), df = pmax(pairwise_counts - 2, 1))
+  pval_matrix[pairwise_counts < 3] <- NA_real_
+  diag(pval_matrix) <- 0
+  pval_matrix
+}
+
 if(is_bipartite) {
   bipartite_edges <- node_data_filtered |>
     dplyr::mutate(
@@ -156,8 +168,11 @@ if(is_bipartite) {
   translated_labels <- make.unique(translated_labels)
 
   cor_matrix <- cor(node_value_matrix, use = "pairwise.complete.obs")
+  pval_matrix <- compute_correlation_pvalues(node_value_matrix)
   rownames(cor_matrix) <- translated_labels
   colnames(cor_matrix) <- translated_labels
+  rownames(pval_matrix) <- translated_labels
+  colnames(pval_matrix) <- translated_labels
   cormat_wide <- cor_matrix
 
   node_display_metadata <- tibble::tibble(
@@ -178,6 +193,43 @@ if(is_bipartite) {
 
 cormat_wide[is.na(cormat_wide)] <- 0
 
+if(is_bipartite) {
+  pval_wide <- matrix(0, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
+                      dimnames = dimnames(cormat_wide))
+  fdr_significant_pairs <- matrix(FALSE, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
+                                  dimnames = dimnames(cormat_wide))
+} else {
+  pval_wide <- pval_matrix
+  fdr_significant_pairs <- matrix(FALSE, nrow = nrow(pval_wide), ncol = ncol(pval_wide),
+                                  dimnames = dimnames(pval_wide))
+  upper_tri_mask <- upper.tri(pval_wide) & is.finite(pval_wide) & pval_wide > 0
+  if(any(upper_tri_mask)) {
+    adjusted_upper_pvalues <- stats::p.adjust(pval_wide[upper_tri_mask], method = "BH")
+    fdr_significant_pairs[upper_tri_mask] <- adjusted_upper_pvalues <= 0.2
+    fdr_significant_pairs <- fdr_significant_pairs | t(fdr_significant_pairs)
+  }
+}
+
+node_average_values <- node_data_filtered |>
+  dplyr::group_by(Node) |>
+  dplyr::summarise(Average_Value = mean(Value, na.rm = TRUE), .groups = "drop")
+
+node_average_lookup <- node_display_metadata |>
+  dplyr::select(Node_ID, Node_Name, Partition) |>
+  dplyr::left_join(node_average_values, by = c("Node_Name" = "Node")) |>
+  dplyr::mutate(
+    Average_Value = dplyr::if_else(
+      Partition == "Observation",
+      NA_real_,
+      Average_Value
+    )
+  )
+
+node_average_lookup <- stats::setNames(
+  node_average_lookup$Average_Value,
+  node_average_lookup$Node_ID
+)
+
 cormat <- as.data.frame(as.table(cormat_wide)) |>
   tibble::as_tibble() |>
   dplyr::rename(
@@ -190,8 +242,14 @@ cormat <- as.data.frame(as.table(cormat_wide)) |>
 
 
 ```{r}
-recompute_network <- function(cormat,cutoff, cluster = NA,
-                              filter_pos_corr, filter_neg_corr, filter_singletons) {
+recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
+                              filter_pos_corr, filter_neg_corr, filter_singletons,
+                              color_nodes_by_average = FALSE,
+                              filter_significant_edges = FALSE) {
+
+  if(filter_significant_edges) {
+    cormat[!fdr_significant_pairs] <- 0
+  }
 
   if(filter_neg_corr) {
     cormat[cormat < 0] <- 0
@@ -200,7 +258,7 @@ recompute_network <- function(cormat,cutoff, cluster = NA,
     cormat[cormat > 0] <- 0
     palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))
   } else {
-    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "RdBu"))
+    palette <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))
   }
   
   cor_network <- igraph::graph_from_adjacency_matrix(as.matrix(cormat),
@@ -208,10 +266,11 @@ recompute_network <- function(cormat,cutoff, cluster = NA,
                                                      mode = "max",
                                                      weighted = TRUE)
   
-  
-  ncols <- max(order(igraph::E(cor_network)$weight))
-  edge_palette <- palette(ncols)
-  igraph::E(cor_network)$color <- edge_palette[order(igraph::E(cor_network)$weight)]
+  if(igraph::ecount(cor_network) > 0) {
+    ncols <- igraph::ecount(cor_network)
+    edge_palette <- palette(ncols)
+    igraph::E(cor_network)$color <- edge_palette[order(igraph::E(cor_network)$weight)]
+  }
   
   cluster <- as.numeric(cluster)
   cor_network <- cor_network |>
@@ -231,7 +290,14 @@ recompute_network <- function(cormat,cutoff, cluster = NA,
   cor_network <- cor_network |>
      igraph::set_vertex_attr("betweenness", value = cor_betweenness)
 
-  cluster_membership <- igraph::membership(igraph::cluster_louvain(cor_network))
+  if(igraph::ecount(cor_network) == 0) {
+    cluster_membership <- stats::setNames(
+      seq_len(igraph::vcount(cor_network)),
+      igraph::V(cor_network)$name
+    )
+  } else {
+    cluster_membership <- igraph::membership(igraph::cluster_louvain(cor_network))
+  }
   display_network <- cor_network
   if(!is.na(cluster)) {
     selected_vertices <- which(cluster_membership == cluster)
@@ -255,8 +321,24 @@ recompute_network <- function(cormat,cutoff, cluster = NA,
   vertex_labels <- unname(vertex_metadata$Node_Label)
   vertex_labels[is.na(vertex_labels)] <- vertex_ids[is.na(vertex_labels)]
   node_colors <- unname(palette[as.numeric(cluster_membership)])
+  average_values <- unname(node_average_lookup[vertex_ids])
+
+  if(color_nodes_by_average) {
+    average_scale_max <- max(abs(average_values), na.rm = TRUE)
+    if(is.finite(average_scale_max) && average_scale_max > 0) {
+      average_palette <- grDevices::colorRampPalette(c("blue", "white", "red"))(201)
+      average_indices <- round(((average_values + average_scale_max) / (2 * average_scale_max)) * 200) + 1
+      average_indices[!is.finite(average_indices)] <- NA_integer_
+      average_indices <- pmin(pmax(average_indices, 1), 201)
+      node_colors <- average_palette[average_indices]
+      node_colors[is.na(node_colors)] <- "grey"
+    } else {
+      node_colors <- rep("white", length(vertex_ids))
+      node_colors[is.na(average_values)] <- "grey"
+    }
+  }
   
-  if(any(!is.na(node_display_metadata$Color_Factor))) {
+  if(!color_nodes_by_average && any(!is.na(node_display_metadata$Color_Factor))) {
     node_color_lookup <- node_display_metadata |>
       dplyr::filter(!is.na(Color_Factor), Color_Factor != "") |>
       dplyr::distinct(Node_ID, .keep_all = TRUE)
@@ -302,7 +384,8 @@ recompute_network <- function(cormat,cutoff, cluster = NA,
                       ## font.size = (cor_betweenness+.1)/max(cor_betweenness),
                       title = paste0("<p><b>", "</b><br>Name:", vertex_labels,
                                      "<p><b>", "</b><br>Module:", unname(as.numeric(cluster_membership)),
-                                     "<p><b>", "</b><br>Betweenness: ", unname(cor_betweenness)),
+                                     "<p><b>", "</b><br>Betweenness: ", unname(cor_betweenness),
+                                     "<p><b>", "</b><br>Average value: ", round(average_values, 3)),
                       shape = node_shapes,
                       row.names = NULL
                       )
@@ -456,6 +539,8 @@ shiny::shinyApp(
             6,
             shiny::fluidRow(
  shinydashboard::sidebarSearchForm(textId = "searchText", buttonId = "searchButton", label = "Zoom node..."),
+                     shiny::checkboxInput("color_nodes_by_average", "Color nodes by average value"),
+                     shiny::checkboxInput("filter_significant_edges", "Keep FDR-significant edges only"),
                      shiny::checkboxInput("filter_corr_pos", "Remove positive correlations"),
                      shiny::checkboxInput("filter_corr_neg", "Remove negative correlations"),
                      shiny::checkboxInput("filter_singletons", "Remove unconnected nodes")
@@ -469,6 +554,8 @@ shiny::shinyApp(
           shiny::tags$p("'Correlation cutoff' removes edges whose absolute correlation is below the selected threshold."),
           shiny::tags$p("'Only show module #' limits the display to nodes assigned to a single detected network module."),
           shiny::tags$p("'Find node' searches for an exact node label match and centers the network on that node when found."),
+          shiny::tags$p("'color nodes by average value' colors nodes by the mean of their non-masked observations, using blue for negative values, white for zero, and red for positive values."),
+          shiny::tags$p("'Keep FDR-significant edges only' retains only correlation edges with Benjamini-Hochberg FDR of 0.2 or less."),
           shiny::tags$p("'Remove positive correlations' hides positively correlated edges."),
           shiny::tags$p("'Remove negative correlations' hides negatively correlated edges."),
           shiny::tags$p("'Remove unconnected nodes' hides nodes with no neighbors.")
@@ -480,8 +567,9 @@ shiny::shinyApp(
   
   server = function(input, output,session) {
     reactive_network <- shiny::reactive({
-      recompute_network(cormat_wide, input$cor_adjust, input$pick_module,
-                        input$filter_corr_pos, input$filter_corr_neg, input$filter_singletons)})
+      recompute_network(cormat_wide, pval_wide, input$cor_adjust, input$pick_module,
+                        input$filter_corr_pos, input$filter_corr_neg, input$filter_singletons,
+                        input$color_nodes_by_average, input$filter_significant_edges)})
     output$mynetwork = visNetwork::renderVisNetwork({
       make_network_visual(reactive_network()[[1]], reactive_network()[[2]])})
     output$network_stats <- shiny::renderText({
