@@ -242,6 +242,55 @@ cormat <- as.data.frame(as.table(cormat_wide)) |>
 
 
 ```{r}
+cluster_louvain_stable <- function(graph, seed = 1L) {
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if(had_seed) {
+    original_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  }
+  on.exit({
+    if(had_seed) {
+      assign(".Random.seed", original_seed, envir = .GlobalEnv)
+    } else if(exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+  set.seed(as.integer(seed))
+  igraph::cluster_louvain(graph)
+}
+
+map_edge_colors <- function(weights, positive_only = FALSE, negative_only = FALSE) {
+  if(length(weights) == 0) {
+    return(character(0))
+  }
+
+  if(positive_only) {
+    edge_palette <- grDevices::colorRampPalette(RColorBrewer::brewer.pal(9, "Reds"))(201)
+    max_weight <- max(weights, na.rm = TRUE)
+    if(!is.finite(max_weight) || max_weight <= 0) {
+      return(rep(edge_palette[[101]], length(weights)))
+    }
+    color_idx <- round((weights / max_weight) * 200) + 1
+  } else if(negative_only) {
+    edge_palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))(201)
+    max_weight <- max(abs(weights), na.rm = TRUE)
+    if(!is.finite(max_weight) || max_weight <= 0) {
+      return(rep(edge_palette[[101]], length(weights)))
+    }
+    color_idx <- round((abs(weights) / max_weight) * 200) + 1
+  } else {
+    edge_palette <- grDevices::colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(201)
+    max_weight <- max(abs(weights), na.rm = TRUE)
+    if(!is.finite(max_weight) || max_weight <= 0) {
+      return(rep(edge_palette[[101]], length(weights)))
+    }
+    color_idx <- round(((weights + max_weight) / (2 * max_weight)) * 200) + 1
+  }
+
+  color_idx[!is.finite(color_idx)] <- 101L
+  color_idx <- pmin(pmax(color_idx, 1L), 201L)
+  edge_palette[color_idx]
+}
+
 recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
                               filter_pos_corr, filter_neg_corr, filter_singletons,
                               color_nodes_by_average = FALSE,
@@ -253,25 +302,15 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
 
   if(filter_neg_corr) {
     cormat[cormat < 0] <- 0
-    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Reds"))
   } else if(filter_pos_corr) {
     cormat[cormat > 0] <- 0
-    palette <- colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))
-  } else {
-    palette <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))
   }
   
   cor_network <- igraph::graph_from_adjacency_matrix(as.matrix(cormat),
                                                      diag = FALSE,
                                                      mode = "max",
                                                      weighted = TRUE)
-  
-  if(igraph::ecount(cor_network) > 0) {
-    ncols <- igraph::ecount(cor_network)
-    edge_palette <- palette(ncols)
-    igraph::E(cor_network)$color <- edge_palette[order(igraph::E(cor_network)$weight)]
-  }
-  
+
   cluster <- as.numeric(cluster)
   cor_network <- cor_network |>
     igraph::set_edge_attr("true_weight",value = igraph::E(cor_network)$weight) |>
@@ -281,6 +320,13 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
                           }))
   cor_network <- 
     igraph::delete_edges(cor_network, which(igraph::E(cor_network)$weight == 0))
+  if(igraph::ecount(cor_network) > 0) {
+    igraph::E(cor_network)$color <- map_edge_colors(
+      igraph::E(cor_network)$true_weight,
+      positive_only = filter_neg_corr,
+      negative_only = filter_pos_corr
+    )
+  }
   if(filter_singletons) {
     nodes_to_remove <- which(igraph::degree(cor_network) == 0)
     cor_network <- igraph::delete_vertices(cor_network, nodes_to_remove)
@@ -296,7 +342,7 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
       igraph::V(cor_network)$name
     )
   } else {
-    cluster_membership <- igraph::membership(igraph::cluster_louvain(cor_network))
+    cluster_membership <- igraph::membership(cluster_louvain_stable(cor_network))
   }
   display_network <- cor_network
   if(!is.na(cluster)) {
@@ -310,7 +356,7 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
     module_count <- igraph::vcount(display_network)
     modularity_value <- 0
   } else {
-    display_cluster <- igraph::cluster_louvain(display_network)
+    display_cluster <- cluster_louvain_stable(display_network)
     module_count <- length(unique(igraph::membership(display_cluster)))
     modularity_value <- igraph::modularity(display_cluster)
   }
