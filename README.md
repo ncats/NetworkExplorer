@@ -13,7 +13,7 @@ It then renders the result as an interactive graph with module detection, edge f
 
 - `NetworkExplorer.Rmd`: main Shiny R Markdown application
 - `NetworkExplorerTemplate.xlsx`: template workbook for user-supplied input data
-- `NetworkExplorerMelanoma.xlsx`: example workbook currently referenced by the app
+- `NetworkExplorerMelanoma.xlsx`: example workbook
 - `NetworkExplorerFKTN.xlsx`: additional example workbook
 - `NetworkExplorerLDR.xlsx`: additional example workbook
 - `MIPE_correlations_melanoma.csv`: source/example data file included in the repository
@@ -46,12 +46,51 @@ Open `NetworkExplorer.Rmd` in RStudio and run the document as a Shiny document, 
 rmarkdown::run("NetworkExplorer.Rmd")
 ```
 
-At the top of the file, update the user-editable configuration block as needed:
+Open the app and upload an Excel workbook with the `Network data manifest` control.
 
-```r
-excel_path <- "NetworkExplorerMelanoma.xlsx"
-is_bipartite <- FALSE
-user_palette <- FALSE
+To pre-load a manifest at startup instead of requiring an upload, set `NETWORK_EXPLORER_MANIFEST` before launching:
+
+```sh
+NETWORK_EXPLORER_MANIFEST=NetworkExplorerMelanoma.xlsx Rscript run_app.R
+```
+
+## Running with Docker
+
+Build the image from the repository root:
+
+```sh
+docker build -t network-explorer .
+```
+
+If your network requires a different CRAN mirror, pass it at build time:
+
+```sh
+docker build --build-arg CRAN_REPO=http://cran.r-project.org -t network-explorer .
+```
+
+Run the Shiny R Markdown app on <http://localhost:3838>:
+
+```sh
+docker run --rm -p 3838:3838 network-explorer
+```
+
+The running app accepts a user-uploaded manifest from the browser. To pre-load a manifest that already exists in the image, set `NETWORK_EXPLORER_MANIFEST`:
+
+```sh
+docker run --rm -p 3838:3838 -e NETWORK_EXPLORER_MANIFEST=NetworkExplorerBiallelic.xlsx network-explorer
+```
+
+To run a different R Markdown file copied into the image, set `RMD_FILE`:
+
+```sh
+docker run --rm -p 3838:3838 -e RMD_FILE=NetworkExplorer.Rmd network-explorer
+```
+
+The initial settings for manifest interpretation can be set with environment variables:
+
+```sh
+NETWORK_EXPLORER_BIPARTITE=true
+NETWORK_EXPLORER_USER_PALETTE=false
 ```
 
 ## Input Workbook Format
@@ -90,4 +129,3 @@ Use `NetworkExplorerTemplate.xlsx` as the starting point for new datasets.
 - Removal of singleton nodes
 - Exact-match node search and focus
 - Node label, color, and shape customization from metadata
-

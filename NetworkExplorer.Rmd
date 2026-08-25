@@ -16,66 +16,61 @@ knitr::opts_chunk$set(message=FALSE,warning=FALSE,
 
 ```{r USER EDIT THIS CHUNK ONLY}
 
-## Path for your Network data manifest
-excel_path <- "NetworkExplorerMelanoma.xlsx"
-is_bipartite <- FALSE
-user_palette <- FALSE
+parse_logical_env <- function(name, default) {
+  value <- Sys.getenv(name, unset = NA_character_)
+  if(is.na(value) || value == "") {
+    return(default)
+  }
+  tolower(value) %in% c("1", "true", "t", "yes", "y")
+}
+
+## Optional startup defaults. Leave NETWORK_EXPLORER_MANIFEST unset to require
+## users to upload a manifest from the app.
+default_manifest_path <- Sys.getenv("NETWORK_EXPLORER_MANIFEST", unset = "")
+default_is_bipartite <- parse_logical_env("NETWORK_EXPLORER_BIPARTITE", TRUE)
+default_user_palette <- parse_logical_env("NETWORK_EXPLORER_USER_PALETTE", TRUE)
 ```
 
 
 ```{r}
-node_metadata <- readxl::read_excel(excel_path, sheet = 1) |>
-  dplyr::mutate(
-    Node_Name = as.character(Node_Name),
-    Node_Label = dplyr::case_when(
-      is.na(Node_Label) | Node_Label == "" ~ as.character(Node_Name),
-      TRUE ~ as.character(Node_Label)
-    ),
-    Color_Factor = dplyr::case_when(
-      is.na(Color_Factor) | Color_Factor == "" ~ NA_character_,
-      TRUE ~ as.character(Color_Factor)
-    ),
-    Shape_Factor = dplyr::case_when(
-      is.na(Shape_Factor) | Shape_Factor == "" ~ NA_character_,
-      TRUE ~ as.character(Shape_Factor)
+select_manifest_sheet <- function(sheet_names, sheet_name, fallback_index) {
+  if(sheet_name %in% sheet_names) {
+    return(sheet_name)
+  }
+  if(length(sheet_names) >= fallback_index) {
+    return(fallback_index)
+  }
+  stop(
+    "Manifest workbook is missing the ",
+    sheet_name,
+    " sheet and does not have sheet #",
+    fallback_index,
+    ".",
+    call. = FALSE
+  )
+}
+
+ensure_columns <- function(data, columns) {
+  for(column in columns) {
+    if(!column %in% names(data)) {
+      data[[column]] <- NA_character_
+    }
+  }
+  data
+}
+
+check_required_columns <- function(data, required_columns, sheet_name) {
+  missing_columns <- setdiff(required_columns, names(data))
+  if(length(missing_columns) > 0) {
+    stop(
+      "Manifest sheet ",
+      sheet_name,
+      " is missing required column(s): ",
+      paste(missing_columns, collapse = ", "),
+      call. = FALSE
     )
-  ) |>
-  dplyr::select(Node_Name, Node_Label, Color_Factor, Shape_Factor) |>
-  dplyr::distinct(Node_Name, .keep_all = TRUE) |>
-  dplyr::filter(!is.na(Node_Name), Node_Name != "")
-
-selected_nodes <- node_metadata$Node_Name
-
-node_data <- readxl::read_excel(excel_path, sheet = 2) |>
-  dplyr::mutate(
-    Node = as.character(Node),
-    Observation = as.character(Observation),
-    Value = as.numeric(Value)
-  ) |>
-  dplyr::select(Node, Observation, Value)
-
-node_mask_raw <- readxl::read_excel(excel_path, sheet = 3)
-
-masked_observations <- tibble::tibble(
-  Observation = as.character(node_mask_raw[[4]]),
-  Mask = dplyr::coalesce(as.logical(node_mask_raw[[5]]), FALSE)
-) |>
-  dplyr::filter(Mask, !is.na(Observation), Observation != "") |>
-  dplyr::distinct(Observation)
-
-masked_nodes <- tibble::tibble(
-  Node = as.character(node_mask_raw[[1]]),
-  Mask = dplyr::coalesce(as.logical(node_mask_raw[[2]]), FALSE)
-) |>
-  dplyr::filter(Mask, !is.na(Node), Node != "") |>
-  dplyr::distinct(Node)
-
-node_data_filtered <- node_data |>
-  dplyr::filter(
-    !Observation %in% masked_observations$Observation,
-    !Node %in% masked_nodes$Node
-  ) |>
-  dplyr::select(Node, Observation, Value)
+  }
+}
 
 compute_correlation_pvalues <- function(value_matrix) {
   pairwise_counts <- crossprod(!is.na(value_matrix))
@@ -89,155 +84,260 @@ compute_correlation_pvalues <- function(value_matrix) {
   pval_matrix
 }
 
-if(is_bipartite) {
-  bipartite_edges <- node_data_filtered |>
+load_network_manifest <- function(manifest_path, is_bipartite = TRUE, user_palette = TRUE) {
+  if(!file.exists(manifest_path)) {
+    stop("Manifest file not found: ", manifest_path, call. = FALSE)
+  }
+
+  sheet_names <- readxl::excel_sheets(manifest_path)
+  metadata_sheet <- select_manifest_sheet(sheet_names, "Metadata", 1)
+  data_sheet <- select_manifest_sheet(sheet_names, "Data", 2)
+  mask_sheet <- select_manifest_sheet(sheet_names, "Data_Mask", 3)
+
+  node_metadata_raw <- readxl::read_excel(manifest_path, sheet = metadata_sheet)
+  check_required_columns(node_metadata_raw, "Node_Name", "Metadata")
+
+  node_metadata <- node_metadata_raw |>
+    ensure_columns(c("Node_Label", "Color_Factor", "Shape_Factor")) |>
     dplyr::mutate(
-      from = paste0("node::", Node),
-      to = paste0("obs::", Observation)
-    ) |>
-    dplyr::select(from, to, value = Value)
-
-  bipartite_edges <- dplyr::bind_rows(
-    bipartite_edges,
-    bipartite_edges |>
-      dplyr::mutate(from_rev = to, to_rev = from) |>
-      dplyr::select(from = from_rev, to = to_rev, value)
-  )
-
-  bipartite_ids <- union(unique(bipartite_edges$from), unique(bipartite_edges$to))
-  cormat_wide <- stats::xtabs(
-    value ~ from + to,
-    data = bipartite_edges |>
-      dplyr::mutate(
-        from = factor(from, levels = bipartite_ids),
-        to = factor(to, levels = bipartite_ids)
-      )
-  ) |>
-    as.matrix()
-
-  node_display_metadata <- dplyr::bind_rows(
-    node_data_filtered |>
-      dplyr::distinct(Node) |>
-      dplyr::rename(Node_Name = Node) |>
-      dplyr::mutate(
-        Node_ID = paste0("node::", Node_Name),
-        Partition = "Node"
-      ),
-    node_data_filtered |>
-      dplyr::distinct(Observation) |>
-      dplyr::rename(Node_Name = Observation) |>
-      dplyr::mutate(
-        Node_ID = paste0("obs::", Node_Name),
-        Partition = "Observation"
-      )
-  ) |>
-    dplyr::left_join(node_metadata, by = "Node_Name") |>
-    dplyr::mutate(
+      Node_Name = as.character(Node_Name),
       Node_Label = dplyr::case_when(
-        is.na(Node_Label) | Node_Label == "" ~ Node_Name,
-        TRUE ~ Node_Label
+        is.na(Node_Label) | Node_Label == "" ~ as.character(Node_Name),
+        TRUE ~ as.character(Node_Label)
+      ),
+      Color_Factor = dplyr::case_when(
+        is.na(Color_Factor) | Color_Factor == "" ~ NA_character_,
+        TRUE ~ as.character(Color_Factor)
+      ),
+      Shape_Factor = dplyr::case_when(
+        is.na(Shape_Factor) | Shape_Factor == "" ~ NA_character_,
+        TRUE ~ as.character(Shape_Factor)
+      )
+    ) |>
+    dplyr::select(Node_Name, Node_Label, Color_Factor, Shape_Factor) |>
+    dplyr::distinct(Node_Name, .keep_all = TRUE) |>
+    dplyr::filter(!is.na(Node_Name), Node_Name != "")
+
+  selected_nodes <- node_metadata$Node_Name
+
+  node_data_raw <- readxl::read_excel(manifest_path, sheet = data_sheet)
+  check_required_columns(node_data_raw, c("Node", "Observation", "Value"), "Data")
+
+  node_data <- node_data_raw |>
+    dplyr::mutate(
+      Node = as.character(Node),
+      Observation = as.character(Observation),
+      Value = as.numeric(Value)
+    ) |>
+    dplyr::select(Node, Observation, Value)
+
+  node_mask_raw <- readxl::read_excel(
+    manifest_path,
+    sheet = mask_sheet,
+    .name_repair = "minimal"
+  )
+  if(ncol(node_mask_raw) < 5) {
+    stop(
+      "Manifest sheet Data_Mask must have at least five columns: ",
+      "node name, node mask, spacer, observation name, observation mask.",
+      call. = FALSE
+    )
+  }
+
+  masked_observations <- tibble::tibble(
+    Observation = as.character(node_mask_raw[[4]]),
+    Mask = dplyr::coalesce(as.logical(node_mask_raw[[5]]), FALSE)
+  ) |>
+    dplyr::filter(Mask, !is.na(Observation), Observation != "") |>
+    dplyr::distinct(Observation)
+
+  masked_nodes <- tibble::tibble(
+    Node = as.character(node_mask_raw[[1]]),
+    Mask = dplyr::coalesce(as.logical(node_mask_raw[[2]]), FALSE)
+  ) |>
+    dplyr::filter(Mask, !is.na(Node), Node != "") |>
+    dplyr::distinct(Node)
+
+  node_data_filtered <- node_data |>
+    dplyr::filter(
+      !Observation %in% masked_observations$Observation,
+      !Node %in% masked_nodes$Node
+    ) |>
+    dplyr::select(Node, Observation, Value)
+
+  if(nrow(node_data_filtered) == 0) {
+    stop("No data rows remain after applying the Data_Mask sheet.", call. = FALSE)
+  }
+
+  if(isTRUE(is_bipartite)) {
+    bipartite_edges <- node_data_filtered |>
+      dplyr::mutate(
+        from = paste0("node::", Node),
+        to = paste0("obs::", Observation)
+      ) |>
+      dplyr::select(from, to, value = Value)
+
+    bipartite_edges <- dplyr::bind_rows(
+      bipartite_edges,
+      bipartite_edges |>
+        dplyr::mutate(from_rev = to, to_rev = from) |>
+        dplyr::select(from = from_rev, to = to_rev, value)
+    )
+
+    bipartite_ids <- union(unique(bipartite_edges$from), unique(bipartite_edges$to))
+    cormat_wide <- stats::xtabs(
+      value ~ from + to,
+      data = bipartite_edges |>
+        dplyr::mutate(
+          from = factor(from, levels = bipartite_ids),
+          to = factor(to, levels = bipartite_ids)
+        )
+    ) |>
+      as.matrix()
+
+    node_display_metadata <- dplyr::bind_rows(
+      node_data_filtered |>
+        dplyr::distinct(Node) |>
+        dplyr::rename(Node_Name = Node) |>
+        dplyr::mutate(
+          Node_ID = paste0("node::", Node_Name),
+          Partition = "Node"
+        ),
+      node_data_filtered |>
+        dplyr::distinct(Observation) |>
+        dplyr::rename(Node_Name = Observation) |>
+        dplyr::mutate(
+          Node_ID = paste0("obs::", Node_Name),
+          Partition = "Observation"
+        )
+    ) |>
+      dplyr::left_join(node_metadata, by = "Node_Name") |>
+      dplyr::mutate(
+        Node_Label = dplyr::case_when(
+          is.na(Node_Label) | Node_Label == "" ~ Node_Name,
+          TRUE ~ Node_Label
+        )
+      )
+
+    node_display_metadata$Node_Label <- make.unique(node_display_metadata$Node_Label)
+    node_display_metadata <- node_display_metadata |>
+      dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
+  } else {
+    selected_nodes <- intersect(selected_nodes, unique(node_data_filtered$Node))
+    if(length(selected_nodes) == 0) {
+      stop(
+        "No unmasked nodes from Metadata$Node_Name remain after filtering. ",
+        "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet.",
+        call. = FALSE
+      )
+    }
+    if(length(selected_nodes) < 2) {
+      stop(
+        "At least two unmasked nodes from Metadata$Node_Name are required to compute correlations. ",
+        "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet.",
+        call. = FALSE
+      )
+    }
+
+    node_value_matrix <- node_data_filtered |>
+      dplyr::filter(Node %in% selected_nodes) |>
+      tidyr::pivot_wider(names_from = Node, values_from = Value) |>
+      tibble::column_to_rownames("Observation") |>
+      as.matrix()
+
+    translated_labels <- node_metadata$Node_Label[match(colnames(node_value_matrix), node_metadata$Node_Name)]
+    translated_labels[is.na(translated_labels)] <- colnames(node_value_matrix)[is.na(translated_labels)]
+    translated_labels <- make.unique(translated_labels)
+
+    cor_matrix <- cor(node_value_matrix, use = "pairwise.complete.obs")
+    pval_matrix <- compute_correlation_pvalues(node_value_matrix)
+    rownames(cor_matrix) <- translated_labels
+    colnames(cor_matrix) <- translated_labels
+    rownames(pval_matrix) <- translated_labels
+    colnames(pval_matrix) <- translated_labels
+    cormat_wide <- cor_matrix
+
+    node_display_metadata <- tibble::tibble(
+      Node_ID = translated_labels,
+      Node_Name = colnames(node_value_matrix)
+    ) |>
+      dplyr::left_join(
+        node_metadata |>
+          dplyr::select(Node_Name, Color_Factor, Shape_Factor),
+        by = "Node_Name"
+      ) |>
+      dplyr::mutate(
+        Node_Label = Node_ID,
+        Partition = "Correlation"
+      ) |>
+      dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
+  }
+
+  cormat_wide[is.na(cormat_wide)] <- 0
+
+  if(isTRUE(is_bipartite)) {
+    pval_wide <- matrix(0, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
+                        dimnames = dimnames(cormat_wide))
+    fdr_adjusted_pvalues <- matrix(NA_real_, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
+                                   dimnames = dimnames(cormat_wide))
+  } else {
+    pval_wide <- pval_matrix
+    fdr_adjusted_pvalues <- matrix(NA_real_, nrow = nrow(pval_wide), ncol = ncol(pval_wide),
+                                   dimnames = dimnames(pval_wide))
+    diag(fdr_adjusted_pvalues) <- 0
+    upper_tri_mask <- upper.tri(pval_wide) & is.finite(pval_wide) & pval_wide > 0
+    if(any(upper_tri_mask)) {
+      adjusted_upper_pvalues <- stats::p.adjust(pval_wide[upper_tri_mask], method = "BH")
+      upper_tri_indices <- which(upper_tri_mask, arr.ind = TRUE)
+      fdr_adjusted_pvalues[upper_tri_indices] <- adjusted_upper_pvalues
+      fdr_adjusted_pvalues[cbind(upper_tri_indices[, 2], upper_tri_indices[, 1])] <- adjusted_upper_pvalues
+    }
+  }
+
+  node_average_values <- node_data_filtered |>
+    dplyr::group_by(Node) |>
+    dplyr::summarise(Average_Value = mean(Value, na.rm = TRUE), .groups = "drop")
+
+  node_average_lookup <- node_display_metadata |>
+    dplyr::select(Node_ID, Node_Name, Partition) |>
+    dplyr::left_join(node_average_values, by = c("Node_Name" = "Node")) |>
+    dplyr::mutate(
+      Average_Value = dplyr::if_else(
+        Partition == "Observation",
+        NA_real_,
+        Average_Value
       )
     )
 
-  node_display_metadata$Node_Label <- make.unique(node_display_metadata$Node_Label)
-  node_display_metadata <- node_display_metadata |>
-    dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
-} else {
-  selected_nodes <- intersect(selected_nodes, unique(node_data_filtered$Node))
-  if(length(selected_nodes) == 0) {
-    stop(
-      "No unmasked nodes from Metadata$Node_Name remain after filtering. ",
-      "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet."
-    )
-  }
-  if(length(selected_nodes) < 2) {
-    stop(
-      "At least two unmasked nodes from Metadata$Node_Name are required to compute correlations. ",
-      "Check the Data_Mask sheet or the Node_Name values in the Metadata sheet."
-    )
-  }
-
-  node_value_matrix <- node_data_filtered |>
-    dplyr::filter(Node %in% selected_nodes) |>
-    tidyr::pivot_wider(names_from = Node, values_from = Value) |>
-    tibble::column_to_rownames("Observation") |>
-    as.matrix()
-
-  translated_labels <- node_metadata$Node_Label[match(colnames(node_value_matrix), node_metadata$Node_Name)]
-  translated_labels[is.na(translated_labels)] <- colnames(node_value_matrix)[is.na(translated_labels)]
-  translated_labels <- make.unique(translated_labels)
-
-  cor_matrix <- cor(node_value_matrix, use = "pairwise.complete.obs")
-  pval_matrix <- compute_correlation_pvalues(node_value_matrix)
-  rownames(cor_matrix) <- translated_labels
-  colnames(cor_matrix) <- translated_labels
-  rownames(pval_matrix) <- translated_labels
-  colnames(pval_matrix) <- translated_labels
-  cormat_wide <- cor_matrix
-
-  node_display_metadata <- tibble::tibble(
-    Node_ID = translated_labels,
-    Node_Name = colnames(node_value_matrix)
-  ) |>
-    dplyr::left_join(
-      node_metadata |>
-        dplyr::select(Node_Name, Color_Factor, Shape_Factor),
-      by = "Node_Name"
-    ) |>
-    dplyr::mutate(
-      Node_Label = Node_ID,
-      Partition = "Correlation"
-    ) |>
-    dplyr::select(Node_ID, Node_Name, Node_Label, Color_Factor, Shape_Factor, Partition)
-}
-
-cormat_wide[is.na(cormat_wide)] <- 0
-
-if(is_bipartite) {
-  pval_wide <- matrix(0, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
-                      dimnames = dimnames(cormat_wide))
-  fdr_significant_pairs <- matrix(FALSE, nrow = nrow(cormat_wide), ncol = ncol(cormat_wide),
-                                  dimnames = dimnames(cormat_wide))
-} else {
-  pval_wide <- pval_matrix
-  fdr_significant_pairs <- matrix(FALSE, nrow = nrow(pval_wide), ncol = ncol(pval_wide),
-                                  dimnames = dimnames(pval_wide))
-  upper_tri_mask <- upper.tri(pval_wide) & is.finite(pval_wide) & pval_wide > 0
-  if(any(upper_tri_mask)) {
-    adjusted_upper_pvalues <- stats::p.adjust(pval_wide[upper_tri_mask], method = "BH")
-    fdr_significant_pairs[upper_tri_mask] <- adjusted_upper_pvalues <= 0.2
-    fdr_significant_pairs <- fdr_significant_pairs | t(fdr_significant_pairs)
-  }
-}
-
-node_average_values <- node_data_filtered |>
-  dplyr::group_by(Node) |>
-  dplyr::summarise(Average_Value = mean(Value, na.rm = TRUE), .groups = "drop")
-
-node_average_lookup <- node_display_metadata |>
-  dplyr::select(Node_ID, Node_Name, Partition) |>
-  dplyr::left_join(node_average_values, by = c("Node_Name" = "Node")) |>
-  dplyr::mutate(
-    Average_Value = dplyr::if_else(
-      Partition == "Observation",
-      NA_real_,
-      Average_Value
-    )
+  node_average_lookup <- stats::setNames(
+    node_average_lookup$Average_Value,
+    node_average_lookup$Node_ID
   )
 
-node_average_lookup <- stats::setNames(
-  node_average_lookup$Average_Value,
-  node_average_lookup$Node_ID
-)
+  cormat <- as.data.frame(as.table(cormat_wide)) |>
+    tibble::as_tibble() |>
+    dplyr::rename(
+      Var1 = dplyr::any_of(c("Var1", "from")),
+      Var2 = dplyr::any_of(c("Var2", "to")),
+      value = dplyr::any_of(c("Freq", "value"))
+    )
 
-cormat <- as.data.frame(as.table(cormat_wide)) |>
-  tibble::as_tibble() |>
-  dplyr::rename(
-    Var1 = dplyr::any_of(c("Var1", "from")),
-    Var2 = dplyr::any_of(c("Var2", "to")),
-    value = dplyr::any_of(c("Freq", "value"))
+  list(
+    manifest_path = manifest_path,
+    manifest_name = basename(manifest_path),
+    cormat_wide = cormat_wide,
+    cormat = cormat,
+    fdr_adjusted_pvalues = fdr_adjusted_pvalues,
+    node_display_metadata = node_display_metadata,
+    node_average_lookup = node_average_lookup,
+    is_bipartite = isTRUE(is_bipartite),
+    user_palette = isTRUE(user_palette),
+    node_count = nrow(node_display_metadata),
+    data_row_count = nrow(node_data_filtered),
+    masked_node_count = nrow(masked_nodes),
+    masked_observation_count = nrow(masked_observations)
   )
-
+}
 ```
 
 
@@ -291,12 +391,35 @@ map_edge_colors <- function(weights, positive_only = FALSE, negative_only = FALS
   edge_palette[color_idx]
 }
 
-recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
+recompute_network <- function(cormat, fdr_adjusted_pvalues, node_display_metadata,
+                              node_average_lookup, is_bipartite, user_palette,
+                              cutoff, cluster = NA,
                               filter_pos_corr, filter_neg_corr, filter_singletons,
                               color_nodes_by_average = FALSE,
-                              filter_significant_edges = FALSE) {
+                              filter_significant_edges = FALSE,
+                              fdr_cutoff = 0.2) {
+  cutoff <- suppressWarnings(as.numeric(cutoff))
+  if(length(cutoff) == 0 || !is.finite(cutoff)) {
+    cutoff <- 0.1
+  }
+  cutoff <- min(max(cutoff, 0), 1)
+  cluster <- suppressWarnings(as.numeric(cluster))
+  if(length(cluster) == 0 || !is.finite(cluster)) {
+    cluster <- NA_real_
+  }
+  filter_pos_corr <- isTRUE(filter_pos_corr)
+  filter_neg_corr <- isTRUE(filter_neg_corr)
+  filter_singletons <- isTRUE(filter_singletons)
+  color_nodes_by_average <- isTRUE(color_nodes_by_average)
+  filter_significant_edges <- isTRUE(filter_significant_edges)
 
   if(filter_significant_edges) {
+    fdr_cutoff <- suppressWarnings(as.numeric(fdr_cutoff))
+    if(!is.finite(fdr_cutoff)) {
+      fdr_cutoff <- 0.2
+    }
+    fdr_cutoff <- min(max(fdr_cutoff, 0), 1)
+    fdr_significant_pairs <- is.finite(fdr_adjusted_pvalues) & fdr_adjusted_pvalues <= fdr_cutoff
     cormat[!fdr_significant_pairs] <- 0
   }
 
@@ -311,7 +434,6 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
                                                      mode = "max",
                                                      weighted = TRUE)
 
-  cluster <- as.numeric(cluster)
   cor_network <- cor_network |>
     igraph::set_edge_attr("true_weight",value = igraph::E(cor_network)$weight) |>
     igraph::set_edge_attr("weight",
@@ -421,26 +543,51 @@ recompute_network <- function(cormat, pval_matrix, cutoff, cluster = NA,
   
   igraph::V(cor_network)$frame.color <- "white"
   igraph::V(cor_network)$frame.width <- 0
-  cor_network_df <- igraph::as_long_data_frame(cor_network)
-  nodes <- data.frame(id = vertex_ids,
-                      group = unname(as.numeric(cluster_membership)),
-                      label = vertex_labels,
-                      ## value = (cor_betweenness/max(cor_betweenness))*15,
-                      color=node_colors,
-                      ## font.size = (cor_betweenness+.1)/max(cor_betweenness),
-                      title = paste0("<p><b>", "</b><br>Name:", vertex_labels,
-                                     "<p><b>", "</b><br>Module:", unname(as.numeric(cluster_membership)),
-                                     "<p><b>", "</b><br>Betweenness: ", unname(cor_betweenness),
-                                     "<p><b>", "</b><br>Average value: ", round(average_values, 3)),
-                      shape = node_shapes,
-                      row.names = NULL
-                      )
-  edges <- data.frame(from = cor_network_df$from_name,
-                      to = cor_network_df$to_name,
-                      width = unname(igraph::E(cor_network)$weight/max(igraph::E(cor_network)$weight)),
-                      color = unname(igraph::E(cor_network)$color),
-                      row.names = NULL
-                      )
+  if(length(vertex_ids) == 0) {
+    nodes <- data.frame(id = character(0),
+                        group = numeric(0),
+                        label = character(0),
+                        color = character(0),
+                        title = character(0),
+                        shape = character(0),
+                        row.names = NULL
+                        )
+  } else {
+    nodes <- data.frame(id = vertex_ids,
+                        group = unname(as.numeric(cluster_membership)),
+                        label = vertex_labels,
+                        ## value = (cor_betweenness/max(cor_betweenness))*15,
+                        color=node_colors,
+                        ## font.size = (cor_betweenness+.1)/max(cor_betweenness),
+                        title = paste0("<p><b>", "</b><br>Name:", vertex_labels,
+                                       "<p><b>", "</b><br>Module:", unname(as.numeric(cluster_membership)),
+                                       "<p><b>", "</b><br>Betweenness: ", unname(cor_betweenness),
+                                       "<p><b>", "</b><br>Average value: ", round(average_values, 3)),
+                        shape = node_shapes,
+                        row.names = NULL
+                        )
+  }
+  if(igraph::ecount(cor_network) == 0) {
+    edges <- data.frame(from = character(0),
+                        to = character(0),
+                        width = numeric(0),
+                        color = character(0),
+                        row.names = NULL
+                        )
+  } else {
+    cor_network_df <- igraph::as_long_data_frame(cor_network)
+    edge_weights <- as.numeric(igraph::E(cor_network)$weight)
+    max_edge_weight <- max(edge_weights, na.rm = TRUE)
+    if(!is.finite(max_edge_weight) || max_edge_weight <= 0) {
+      max_edge_weight <- 1
+    }
+    edges <- data.frame(from = cor_network_df$from_name,
+                        to = cor_network_df$to_name,
+                        width = unname(edge_weights/max_edge_weight),
+                        color = unname(igraph::E(cor_network)$color),
+                        row.names = NULL
+                        )
+  }
   if(!is.na(cluster)) {
     nodes <- nodes |>
       dplyr::filter(group == cluster)
@@ -557,6 +704,9 @@ shiny::shinyApp(
             padding: 10px 12px;
             font-weight: bold;
           }
+          .manifest-controls {
+            margin-bottom: 12px;
+          }
         ")
       )
     ),
@@ -566,6 +716,34 @@ shiny::shinyApp(
         10,
         class = "main-panel",
         style = "width: 75%;",
+        shiny::fluidRow(
+          class = "manifest-controls",
+          shiny::column(
+            6,
+            shiny::fileInput(
+              "manifest_file",
+              label = "Network data manifest",
+              accept = c(".xls", ".xlsx")
+            )
+          ),
+          shiny::column(
+            3,
+            shiny::checkboxInput(
+              "is_bipartite",
+              "Bipartite network",
+              value = default_is_bipartite
+            )
+          ),
+          shiny::column(
+            3,
+            shiny::checkboxInput(
+              "user_palette",
+              "Color_Factor contains colors",
+              value = default_user_palette
+            )
+          )
+        ),
+        shiny::uiOutput("manifest_status"),
         visNetwork::visNetworkOutput("mynetwork", height = "600px"),
         shiny::fluidRow(
           shiny::column(
@@ -587,6 +765,11 @@ shiny::shinyApp(
  shinydashboard::sidebarSearchForm(textId = "searchText", buttonId = "searchButton", label = "Zoom node..."),
                      shiny::checkboxInput("color_nodes_by_average", "Color nodes by average value"),
                      shiny::checkboxInput("filter_significant_edges", "Keep FDR-significant edges only"),
+                     shiny::conditionalPanel(
+                       condition = "input.filter_significant_edges",
+                       shiny::numericInput("fdr_cutoff", label = "FDR significance cutoff:",
+                                           min = 0, max = 1, value = 0.2, step = 0.01)
+                     ),
                      shiny::checkboxInput("filter_corr_pos", "Remove positive correlations"),
                      shiny::checkboxInput("filter_corr_neg", "Remove negative correlations"),
                      shiny::checkboxInput("filter_singletons", "Remove unconnected nodes")
@@ -596,12 +779,15 @@ shiny::shinyApp(
         shiny::div(
           class = "ui-help-box",
           shiny::tags$strong("Network Explorer"),
+          shiny::tags$p("'Network data manifest' loads a user-provided Excel manifest workbook."),
+          shiny::tags$p("'Bipartite network' switches between bipartite and correlation network construction."),
+          shiny::tags$p("'Color_Factor contains colors' treats Color_Factor values as literal color names or hex values."),
           shiny::tags$p("'Current Network Stats' dynamically displays the module count and modularity of the currently displayed network."),
           shiny::tags$p("'Correlation cutoff' removes edges whose absolute correlation is below the selected threshold."),
           shiny::tags$p("'Only show module #' limits the display to nodes assigned to a single detected network module."),
           shiny::tags$p("'Find node' searches for an exact node label match and centers the network on that node when found."),
           shiny::tags$p("'color nodes by average value' colors nodes by the mean of their non-masked observations, using blue for negative values, white for zero, and red for positive values."),
-          shiny::tags$p("'Keep FDR-significant edges only' retains only correlation edges with Benjamini-Hochberg FDR of 0.2 or less."),
+          shiny::tags$p("'Keep FDR-significant edges only' retains only correlation edges with Benjamini-Hochberg FDR at or below the selected cutoff."),
           shiny::tags$p("'Remove positive correlations' hides positively correlated edges."),
           shiny::tags$p("'Remove negative correlations' hides negatively correlated edges."),
           shiny::tags$p("'Remove unconnected nodes' hides nodes with no neighbors.")
@@ -612,10 +798,97 @@ shiny::shinyApp(
   ),
   
   server = function(input, output,session) {
+    manifest_source <- shiny::reactive({
+      uploaded_manifest <- input$manifest_file
+      if(!is.null(uploaded_manifest) && nzchar(uploaded_manifest$datapath)) {
+        return(list(
+          path = uploaded_manifest$datapath,
+          name = uploaded_manifest$name,
+          source = "Uploaded manifest"
+        ))
+      }
+      if(nzchar(default_manifest_path)) {
+        return(list(
+          path = default_manifest_path,
+          name = basename(default_manifest_path),
+          source = "Startup manifest"
+        ))
+      }
+      list(path = "", name = "", source = "")
+    })
+
+    network_manifest <- shiny::reactive({
+      manifest <- manifest_source()
+      shiny::validate(
+        shiny::need(
+          nzchar(manifest$path),
+          "Upload a network manifest workbook to begin."
+        ),
+        shiny::need(
+          file.exists(manifest$path),
+          paste("Manifest file not found:", manifest$path)
+        )
+      )
+
+      current_is_bipartite <- if(is.null(input$is_bipartite)) {
+        default_is_bipartite
+      } else {
+        isTRUE(input$is_bipartite)
+      }
+      current_user_palette <- if(is.null(input$user_palette)) {
+        default_user_palette
+      } else {
+        isTRUE(input$user_palette)
+      }
+
+      tryCatch(
+        load_network_manifest(
+          manifest$path,
+          is_bipartite = current_is_bipartite,
+          user_palette = current_user_palette
+        ),
+        error = function(error) {
+          shiny::validate(shiny::need(FALSE, conditionMessage(error)))
+        }
+      )
+    })
+
     reactive_network <- shiny::reactive({
-      recompute_network(cormat_wide, pval_wide, input$cor_adjust, input$pick_module,
+      manifest <- network_manifest()
+      recompute_network(manifest$cormat_wide, manifest$fdr_adjusted_pvalues,
+                        manifest$node_display_metadata, manifest$node_average_lookup,
+                        manifest$is_bipartite, manifest$user_palette,
+                        input$cor_adjust, input$pick_module,
                         input$filter_corr_pos, input$filter_corr_neg, input$filter_singletons,
-                        input$color_nodes_by_average, input$filter_significant_edges)})
+                        input$color_nodes_by_average, input$filter_significant_edges,
+                        input$fdr_cutoff)})
+    output$manifest_status <- shiny::renderUI({
+      source <- manifest_source()
+      if(!nzchar(source$path)) {
+        return(shiny::div(
+          class = "network-stats-box",
+          "No manifest loaded | Upload a .xlsx or .xls workbook."
+        ))
+      }
+
+      manifest <- network_manifest()
+      shiny::div(
+        class = "network-stats-box",
+        paste0(
+          source$source,
+          ": ",
+          source$name,
+          " | Nodes: ",
+          manifest$node_count,
+          " | Data rows: ",
+          manifest$data_row_count,
+          " | Masked nodes: ",
+          manifest$masked_node_count,
+          " | Masked observations: ",
+          manifest$masked_observation_count
+        )
+      )
+    })
     output$mynetwork = visNetwork::renderVisNetwork({
       make_network_visual(reactive_network()[[1]], reactive_network()[[2]])})
     output$network_stats <- shiny::renderText({

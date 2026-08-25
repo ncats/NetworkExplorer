@@ -1,0 +1,9 @@
+.git
+.DS_Store
+.RData
+.Rhistory
+.Rproj.user
+.Ruserdata
+*.Rproj
+Archive.zip
+*_backup_*.xlsx
