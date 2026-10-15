@@ -1,5 +1,7 @@
 # Network Explorer
 
+Network Explorer enables users to explore single-sample analysis results, capturing relationships between either samples or target sets and recapitulating known disease and biological groupings, respectively.
+
 Interactive network exploration for node-by-observation datasets using an R Markdown Shiny app.
 
 The app reads a structured Excel workbook, computes either:
