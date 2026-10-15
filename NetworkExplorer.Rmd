@@ -12,6 +12,7 @@ runtime: shiny
 ```{r,echo=FALSE}
 knitr::opts_chunk$set(message=FALSE,warning=FALSE, 
                       fig.height=6,fig.width = 12,fig.fullwidth = TRUE,echo = FALSE)
+options(shiny.maxRequestSize = 25 * 1024^2)  # 25 MB
 ```
 
 ```{r USER EDIT THIS CHUNK ONLY}
