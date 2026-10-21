@@ -131,3 +131,7 @@ Use `NetworkExplorerTemplate.xlsx` as the starting point for new datasets.
 - Removal of singleton nodes
 - Exact-match node search and focus
 - Node label, color, and shape customization from metadata
+
+## Contact
+[Andrew Patt](mailto:andrew.patt@nih.gov)
+[Ewy Mathé](mailto:ewy.mathe@nih.gov)
