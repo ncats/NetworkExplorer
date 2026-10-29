@@ -142,3 +142,7 @@ attribute it as:
 > (NCATS), https://github.com/ncats/NetworkExplorer
 
 Include a link to the license and indicate whether changes were made.
+
+## Contact
+[Andrew Patt](mailto:andrew.patt@nih.gov)
+[Ewy Mathé](mailto:ewy.mathe@nih.gov)
