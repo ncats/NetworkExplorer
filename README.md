@@ -132,6 +132,17 @@ Use `NetworkExplorerTemplate.xlsx` as the starting point for new datasets.
 - Exact-match node search and focus
 - Node label, color, and shape customization from metadata
 
+## License
+
+Network Explorer is licensed under the [Creative Commons Attribution 4.0
+International License](LICENSE). When using or adapting this work, please
+attribute it as:
+
+> Network Explorer, National Center for Advancing Translational Sciences
+> (NCATS), https://github.com/ncats/NetworkExplorer
+
+Include a link to the license and indicate whether changes were made.
+
 ## Contact
 [Andrew Patt](mailto:andrew.patt@nih.gov)
 [Ewy Mathé](mailto:ewy.mathe@nih.gov)
